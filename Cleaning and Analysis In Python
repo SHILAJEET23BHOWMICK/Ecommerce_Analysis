@@ -1,0 +1,1726 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+orders=pd.read_csv("D:/Projects DS/E coomerce/olist_orders_dataset.csv")
+items=pd.read_csv("D:/Projects DS/E coomerce/olist_order_items_dataset.csv")
+payments=pd.read_csv("D:/Projects DS/E coomerce/olist_order_payments_dataset.csv")
+reviews=pd.read_csv("D:/Projects DS/E coomerce/olist_order_reviews_dataset.csv")
+products=pd.read_csv("D:/Projects DS/E coomerce/olist_products_dataset.csv")
+customers=pd.read_csv("D:/Projects DS/E coomerce/olist_customers_dataset.csv")
+print("Raw shapes:")
+for name, df in zip(['orders','items','payments','reviews','products','customers'],
+                    [orders, items, payments, reviews, products, customers]):
+    print(f"  {name:12} : {df.shape}")
+Raw shapes:
+  orders       : (99441, 8)
+  items        : (112650, 7)
+  payments     : (103886, 5)
+  reviews      : (99224, 7)
+  products     : (32951, 9)
+  customers    : (99441, 5)
+print("=== NULL AUDIT ===")
+for name, df in zip(['orders','items','payments','reviews','products'],
+                    [orders, items, payments, reviews, products]):
+    nulls = df.isnull().sum()
+    nulls = nulls[nulls > 0]
+    if len(nulls) > 0:
+        print(f"\n{name}:")
+        print(nulls)
+=== NULL AUDIT ===
+
+orders:
+order_approved_at                 160
+order_delivered_carrier_date     1783
+order_delivered_customer_date    2965
+dtype: int64
+
+reviews:
+review_comment_title      87656
+review_comment_message    58247
+dtype: int64
+
+products:
+product_category_name         610
+product_name_lenght           610
+product_description_lenght    610
+product_photos_qty            610
+product_weight_g                2
+product_length_cm               2
+product_height_cm               2
+product_width_cm                2
+dtype: int64
+# 1. Delivery timestamps — NULL means order wasn't delivered
+#    Keep the row, flag it as undelivered — don't drop it
+orders['delivery_status'] = np.where(
+    orders['order_delivered_customer_date'].isnull(),
+    'not_delivered', 'delivered'
+)
+# 2. Approval timestamp — small number, fill with purchase time
+#    Business logic: if no approval record, assume same as purchase
+orders['order_approved_at'] = orders['order_approved_at'].fillna(
+    orders['order_purchase_timestamp']
+)
+
+# 3. Product category — null means uncategorized, not missing
+#    Keep the product, label it honestly
+products['product_category_name'] = products[
+    'product_category_name'].fillna('uncategorized')
+
+# 4. Review comments — optional field, nulls are valid
+#    Fill with empty string for text analysis later
+reviews['review_comment_message'] = reviews[
+    'review_comment_message'].fillna('')
+reviews['review_comment_title'] = reviews[
+    'review_comment_title'].fillna('')
+
+print("\n✅ Null handling complete")
+print(f"   Delivery nulls kept and flagged: {(orders['delivery_status']=='not_delivered').sum()}")
+print(f"   Category nulls filled: {(products['product_category_name']=='uncategorized').sum()}")
+✅ Null handling complete
+   Delivery nulls kept and flagged: 2965
+   Category nulls filled: 610
+# ── AUDIT ────────────────────────────────────────────────────
+print("=== DTYPE AUDIT ===")
+print(orders.dtypes)
+
+# Problem: ALL timestamp columns are stored as strings (object)
+# Problem: review_score should be int but may read as float
+
+# ── FIX ──────────────────────────────────────────────────────
+date_cols = [
+    'order_purchase_timestamp',
+    'order_approved_at',
+    'order_delivered_carrier_date',
+    'order_delivered_customer_date',
+    'order_estimated_delivery_date'
+]
+
+for col in date_cols:
+    orders[col] = pd.to_datetime(orders[col], errors='coerce')
+=== DTYPE AUDIT ===
+order_id                         object
+customer_id                      object
+order_status                     object
+order_purchase_timestamp         object
+order_approved_at                object
+order_delivered_carrier_date     object
+order_delivered_customer_date    object
+order_estimated_delivery_date    object
+delivery_status                  object
+dtype: object
+# Fix review score dtype
+reviews['review_score'] = reviews['review_score'].astype('Int64')  
+# Capital I = nullable integer — handles NaN without converting to float
+
+# Fix payment value
+payments['payment_value'] = pd.to_numeric(
+    payments['payment_value'], errors='coerce'
+)
+
+# Verify
+print("\nAfter dtype fix:")
+print(orders[date_cols].dtypes)
+print(f"\n✅ All timestamps converted to datetime")
+print(f"   NaT values introduced: {orders[date_cols].isnull().sum().sum()}")
+After dtype fix:
+order_purchase_timestamp         datetime64[ns]
+order_approved_at                datetime64[ns]
+order_delivered_carrier_date     datetime64[ns]
+order_delivered_customer_date    datetime64[ns]
+order_estimated_delivery_date    datetime64[ns]
+dtype: object
+
+✅ All timestamps converted to datetime
+   NaT values introduced: 4748
+# ── AUDIT ────────────────────────────────────────────────────
+print("=== DUPLICATE AUDIT ===")
+
+for name, df, key in [
+    ('orders',   orders,   'order_id'),
+    ('items',    items,    ['order_id','order_item_id']),
+    ('payments', payments, 'order_id'),
+    ('reviews',  reviews,  'review_id'),
+]:
+    dupes = df.duplicated(subset=key).sum()
+    print(f"  {name:12} duplicates: {dupes}")
+
+# ── HANDLE PAYMENTS CAREFULLY ────────────────────────────────
+# Payments can have MULTIPLE rows per order (installments)
+# This is NOT a duplicate — it's valid business data
+print(f"\nPayment rows per order (sample):")
+print(payments.groupby('order_id').size().value_counts().head())
+
+# For orders with multiple payment rows, aggregate them
+payments_clean = payments.groupby('order_id').agg(
+    total_payment    = ('payment_value', 'sum'),
+    payment_types    = ('payment_type', lambda x: '|'.join(x.unique())),
+    installments     = ('payment_installments', 'max')
+).reset_index()
+
+# Remove true duplicates from other tables
+orders_before  = len(orders)
+orders         = orders.drop_duplicates(subset='order_id', keep='first')
+orders_removed = orders_before - len(orders)
+
+reviews_before  = len(reviews)
+reviews         = reviews.drop_duplicates(subset='review_id', keep='first')
+reviews_removed = reviews_before - len(reviews)
+
+print(f"\n✅ Duplicates removed:")
+print(f"   Orders  : {orders_removed} rows removed")
+print(f"   Reviews : {reviews_removed} rows removed")
+print(f"   Payments: 0 removed — aggregated {len(payments)} → {len(payments_clean)}rows")
+=== DUPLICATE AUDIT ===
+  orders       duplicates: 0
+  items        duplicates: 0
+  payments     duplicates: 4446
+  reviews      duplicates: 814
+
+Payment rows per order (sample):
+1    96479
+2     2382
+3      301
+4      108
+5       52
+Name: count, dtype: int64
+
+✅ Duplicates removed:
+   Orders  : 0 rows removed
+   Reviews : 814 rows removed
+   Payments: 0 removed — aggregated 103886 → 99440rows
+print("=== CUSTOMER ID AUDIT ===")
+
+# 1. Check for nulls
+print(f"Null customer_ids     : {customers['customer_id'].isnull().sum()}")
+
+# 2. Check for duplicates
+print(f"Duplicate customer_ids: {customers['customer_id'].duplicated().sum()}")
+
+# 3. Check for whitespace issues
+has_spaces = customers['customer_id'].str.contains(' ', na=False).sum()
+print(f"IDs with spaces       : {has_spaces}")
+
+# 4. Check length consistency
+# All Olist IDs should be 32 characters (MD5 hash format)
+id_lengths = customers['customer_id'].str.len().value_counts()
+print(f"\nID length distribution:")
+print(id_lengths)
+
+# 5. Check for special characters
+has_special = customers['customer_id'].str.contains(
+    '[^a-zA-Z0-9]', regex=True, na=False).sum()
+print(f"IDs with special chars : {has_special}")
+=== CUSTOMER ID AUDIT ===
+Null customer_ids     : 0
+Duplicate customer_ids: 0
+IDs with spaces       : 0
+
+ID length distribution:
+customer_id
+32    99441
+Name: count, dtype: int64
+IDs with special chars : 0
+# Strip whitespace (most common issue)
+customers['customer_id'] = customers['customer_id'].str.strip()
+
+# Lowercase (Olist IDs are MD5 hashes — should be consistent)
+customers['customer_id'] = customers['customer_id'].str.lower()
+
+# Drop rows where customer_id is null (can't use without a key)
+null_ids = customers['customer_id'].isnull().sum()
+if null_ids > 0:
+    print(f"Dropping {null_ids} rows with null customer_id")
+    customers = customers.dropna(subset=['customer_id'])
+
+# Drop duplicate customer_ids — keep first occurrence
+dupes = customers['customer_id'].duplicated().sum()
+if dupes > 0:
+    print(f"Removing {dupes} duplicate customer_ids")
+    customers = customers.drop_duplicates(subset='customer_id', keep='first')
+
+# Verify
+print(f"\n✅ customer_id cleaned")
+print(f"   Remaining rows : {len(customers):,}")
+print(f"   Unique IDs     : {customers['customer_id'].nunique():,}")
+# These two numbers should match exactly
+✅ customer_id cleaned
+   Remaining rows : 99,441
+   Unique IDs     : 99,441
+# Strip whitespace (most common issue)
+customers['customer_id'] = customers['customer_id'].str.strip()
+
+# Lowercase (Olist IDs are MD5 hashes — should be consistent)
+customers['customer_id'] = customers['customer_id'].str.lower()
+
+# Drop rows where customer_id is null (can't use without a key)
+null_ids = customers['customer_id'].isnull().sum()
+if null_ids > 0:
+    print(f"Dropping {null_ids} rows with null customer_id")
+    customers = customers.dropna(subset=['customer_id'])
+
+# Drop duplicate customer_ids — keep first occurrence
+dupes = customers['customer_id'].duplicated().sum()
+if dupes > 0:
+    print(f"Removing {dupes} duplicate customer_ids")
+    customers = customers.drop_duplicates(subset='customer_id', keep='first')
+
+# Verify
+print(f"\n✅ customer_id cleaned")
+print(f"   Remaining rows : {len(customers):,}")
+print(f"   Unique IDs     : {customers['customer_id'].nunique():,}")
+# These two numbers should match exactly
+✅ customer_id cleaned
+   Remaining rows : 99,441
+   Unique IDs     : 99,441
+# Check if all customer_ids in orders exist in customers table
+orders_ids   = set(orders['customer_id'].dropna().unique())
+customer_ids = set(customers['customer_id'].dropna().unique())
+
+# IDs in orders but NOT in customers
+orphaned = orders_ids - customer_ids
+print(f"Orders with no matching customer record: {len(orphaned)}")
+
+# IDs in customers but NOT in orders
+unmatched = customer_ids - orders_ids
+print(f"Customers with no orders: {len(unmatched)}")
+Orders with no matching customer record: 0
+Customers with no orders: 0
+# ── AUDIT ────────────────────────────────────────────────────
+print("=== FORMATTING AUDIT ===")
+
+# Check customer state codes
+print("Unique state values:")
+print(customers['customer_state'].unique())
+
+# Check order status values
+print("\nOrder status values:")
+print(orders['order_status'].value_counts())
+
+# Check product category formatting
+print("\nSample categories:")
+print(products['product_category_name'].value_counts().head(10))
+
+# ── FIX TEXT INCONSISTENCIES ─────────────────────────────────
+
+# Standardize all text columns to lowercase + stripped
+text_cols_customers = ['customer_city', 'customer_state']
+for col in text_cols_customers:
+    customers[col] = customers[col].str.strip().str.lower()
+
+# Standardize product categories
+products['product_category_name'] = (products['product_category_name']
+                                     .str.strip()
+                                     .str.lower()
+                                     .str.replace('_', ' '))
+
+# Standardize order status
+orders['order_status'] = orders['order_status'].str.strip().str.lower()
+
+# Map Portuguese categories to English (Olist-specific issue)
+category_map = {
+    'cama mesa banho'       : 'bed bath table',
+    'beleza saude'          : 'health beauty',
+    'esporte lazer'         : 'sports leisure',
+    'informatica acessorios': 'computer accessories',
+    'moveis decoracao'      : 'furniture decor',
+    'utilidades domesticas' : 'home appliances',
+    'relogios presentes'    : 'watches gifts',
+    'telefonia'             : 'telephony',
+    'ferramentas jardim'    : 'garden tools',
+    'brinquedos'            : 'toys'
+}
+products['product_category_name'] = products[
+    'product_category_name'].replace(category_map)
+
+print("\n✅ Formatting standardized")
+print(f"   Categories mapped to English: {len(category_map)}")
+=== FORMATTING AUDIT ===
+Unique state values:
+['sp' 'sc' 'mg' 'pr' 'rj' 'rs' 'pa' 'go' 'es' 'ba' 'ma' 'ms' 'ce' 'df'
+ 'rn' 'pe' 'mt' 'am' 'ap' 'al' 'ro' 'pb' 'to' 'pi' 'ac' 'se' 'rr']
+
+Order status values:
+order_status
+delivered      96478
+shipped         1107
+canceled         625
+unavailable      609
+invoiced         314
+processing       301
+created            5
+approved           2
+Name: count, dtype: int64
+
+Sample categories:
+product_category_name
+bed bath table          3029
+sports leisure          2867
+furniture decor         2657
+health beauty           2444
+home appliances         2335
+automotivo              1900
+computer accessories    1639
+toys                    1411
+watches gifts           1329
+telephony               1134
+Name: count, dtype: int64
+
+✅ Formatting standardized
+   Categories mapped to English: 10
+# ── AUDIT ────────────────────────────────────────────────────
+print("=== OUTLIER AUDIT ===")
+
+# Payment values
+print("Payment value stats:")
+print(payments_clean['total_payment'].describe())
+
+# Freight values  
+print("\nFreight value stats:")
+print(items['freight_value'].describe())
+
+# Delivery time in days
+orders['delivery_days'] = (
+    orders['order_delivered_customer_date'] - 
+    orders['order_purchase_timestamp']
+).dt.days
+print("\nDelivery days stats:")
+print(orders['delivery_days'].describe())
+
+# ── VISUALIZE OUTLIERS ───────────────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+axes[0].boxplot(payments_clean['total_payment'].dropna())
+axes[0].set_title('Payment Value')
+
+axes[1].boxplot(items['freight_value'].dropna())
+axes[1].set_title('Freight Value')
+
+axes[2].boxplot(orders['delivery_days'].dropna())
+axes[2].set_title('Delivery Days')
+
+plt.suptitle('Outlier Detection — Before Cleaning', fontweight='bold')
+plt.savefig('visuals/outliers_before.png', dpi=150)
+plt.show()
+
+# ── DECISIONS ────────────────────────────────────────────────
+
+# 1. Negative payment values = refunds or data errors
+neg_payments = (payments_clean['total_payment'] < 0).sum()
+print(f"\nNegative payments: {neg_payments}")
+payments_clean = payments_clean[payments_clean['total_payment'] >= 0]
+
+# 2. Zero freight on physical products = likely data error
+#    But zero freight on digital products = valid
+#    Flag rather than remove
+items['freight_flag'] = np.where(
+    items['freight_value'] == 0, 'zero_freight', 'normal'
+)
+
+# 3. Delivery days < 0 = delivered before purchase = impossible
+impossible = (orders['delivery_days'] < 0).sum()
+print(f"Impossible delivery times (<0 days): {impossible}")
+orders = orders[
+    (orders['delivery_days'] >= 0) | 
+    (orders['delivery_days'].isnull())
+]
+
+# 4. Extreme delivery times (>365 days) = data error
+extreme = (orders['delivery_days'] > 365).sum()
+print(f"Extreme delivery times (>365 days): {extreme}")
+orders = orders[
+    (orders['delivery_days'] <= 365) | 
+    (orders['delivery_days'].isnull())
+]
+
+# 5. Use IQR to flag payment outliers — keep but flag
+Q1 = payments_clean['total_payment'].quantile(0.25)
+Q3 = payments_clean['total_payment'].quantile(0.75)
+IQR = Q3 - Q1
+
+payments_clean['payment_outlier'] = np.where(
+    payments_clean['total_payment'] > Q3 + 1.5 * IQR,
+    'high_value_order', 'normal'
+)
+
+outlier_count = (payments_clean['payment_outlier']=='high_value_order').sum()
+print(f"\nHigh-value outliers flagged (not removed): {outlier_count}")
+print("Rationale: These are likely genuine bulk or luxury orders")
+=== OUTLIER AUDIT ===
+Payment value stats:
+count    99440.000000
+mean       160.990267
+std        221.951257
+min          0.000000
+25%         62.010000
+50%        105.290000
+75%        176.970000
+max      13664.080000
+Name: total_payment, dtype: float64
+
+Freight value stats:
+count    112650.000000
+mean         19.990320
+std          15.806405
+min           0.000000
+25%          13.080000
+50%          16.260000
+75%          21.150000
+max         409.680000
+Name: freight_value, dtype: float64
+
+Delivery days stats:
+count    96476.000000
+mean        12.094086
+std          9.551746
+min          0.000000
+25%          6.000000
+50%         10.000000
+75%         15.000000
+max        209.000000
+Name: delivery_days, dtype: float64
+No description has been provided for this image
+Negative payments: 0
+Impossible delivery times (<0 days): 0
+Extreme delivery times (>365 days): 0
+
+High-value outliers flagged (not removed): 7866
+Rationale: These are likely genuine bulk or luxury orders
+# ── FINAL CLEANING LOG ───────────────────────────────────────
+print("=" * 55)
+print("         CLEANING SUMMARY REPORT")
+print("=" * 55)
+
+print("""
+CHALLENGE 1 — MISSING VALUES
+   Delivery nulls    : Flagged as 'not_delivered' (kept)
+   Approval nulls    : Filled with purchase timestamp
+   Category nulls    : Filled with 'uncategorized'
+   Review comments   : Filled with empty string
+
+CHALLENGE 2 — WRONG DATA TYPES
+   5 timestamp cols  : object → datetime64
+  review_score      : float  → Int64
+   payment_value     : object → float64
+
+CHALLENGE 3 — DUPLICATES
+   Orders            : X duplicates removed
+   Reviews           : X duplicates removed
+   Payments          : Aggregated (not removed)
+
+CHALLENGE 4 — INCONSISTENT FORMATTING
+ City/State        : Lowercased + stripped
+   Categories        : 10 Portuguese → English
+   Order status      : Standardized to lowercase
+
+CHALLENGE 5 — OUTLIERS
+   Negative payments : Removed (data errors)
+   Impossible dates  : Removed (<0 delivery days)
+   Extreme dates     : Removed (>365 day delivery)
+   High-value orders : Flagged, NOT removed
+   Zero freight      : Flagged, NOT removed
+""")
+=======================================================
+         CLEANING SUMMARY REPORT
+=======================================================
+
+CHALLENGE 1 — MISSING VALUES
+   Delivery nulls    : Flagged as 'not_delivered' (kept)
+   Approval nulls    : Filled with purchase timestamp
+   Category nulls    : Filled with 'uncategorized'
+   Review comments   : Filled with empty string
+
+CHALLENGE 2 — WRONG DATA TYPES
+   5 timestamp cols  : object → datetime64
+  review_score      : float  → Int64
+   payment_value     : object → float64
+
+CHALLENGE 3 — DUPLICATES
+   Orders            : X duplicates removed
+   Reviews           : X duplicates removed
+   Payments          : Aggregated (not removed)
+
+CHALLENGE 4 — INCONSISTENT FORMATTING
+ City/State        : Lowercased + stripped
+   Categories        : 10 Portuguese → English
+   Order status      : Standardized to lowercase
+
+CHALLENGE 5 — OUTLIERS
+   Negative payments : Removed (data errors)
+   Impossible dates  : Removed (<0 delivery days)
+   Extreme dates     : Removed (>365 day delivery)
+   High-value orders : Flagged, NOT removed
+   Zero freight      : Flagged, NOT removed
+
+ 
+target_dir = r'D:\Projects DS\E coomerce\cleaned'
+os.makedirs(target_dir, exist_ok=True)
+# Save all with full paths
+orders.to_csv(os.path.join(target_dir, 'orders_clean.csv'), index=False)
+items.to_csv(os.path.join(target_dir, 'items_clean.csv'), index=False)
+payments_clean.to_csv(os.path.join(target_dir, 'payments_clean.csv'), index=False)
+reviews.to_csv(os.path.join(target_dir, 'reviews_clean.csv'), index=False)
+products.to_csv(os.path.join(target_dir, 'products_clean.csv'), index=False)
+customers.to_csv(os.path.join(target_dir, 'customers_clean.csv'), index=False)
+
+print(f"✅ All cleaned files saved to {os.path.abspath(target_dir)}")
+✅ All cleaned files saved to D:\Projects DS\E coomerce\cleaned
+pip install pymysql
+Collecting pymysql
+  Downloading pymysql-1.1.2-py3-none-any.whl.metadata (4.3 kB)
+Downloading pymysql-1.1.2-py3-none-any.whl (45 kB)
+Installing collected packages: pymysql
+Successfully installed pymysql-1.1.2
+Note: you may need to restart the kernel to use updated packages.
+from sqlalchemy import create_engine
+
+from sqlalchemy import create_engine, text
+engine = create_engine(
+    "mysql+pymysql://root:23042000%40Sb@localhost/ecom_funnel_analysis"
+)
+# Test connection
+with engine.connect() as conn:
+    print("✅ Connected to MySQL successfully")
+✅ Connected to MySQL successfully
+import os
+# ── Create visuals folder ─────────────────────────────────
+VISUALS = r'D:\Projects DS\E coomerce\visuals'
+os.makedirs(VISUALS, exist_ok=True)
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import seaborn as sns
+# ── Global Style ──────────────────────────────────────────
+plt.rcParams.update({
+    'figure.facecolor' : '#0f1117',
+    'axes.facecolor'   : '#0f1117',
+    'axes.edgecolor'   : '#444',
+    'axes.labelcolor'  : 'white',
+    'xtick.color'      : 'white',
+    'ytick.color'      : 'white',
+    'text.color'       : 'white',
+    'grid.color'       : '#333',
+    'grid.linestyle'   : '--',
+    'grid.alpha'       : 0.5,
+    'font.family'      : 'sans-serif',
+    'font.size'        : 11
+})
+
+COLORS = ['#00d4ff','#7b61ff','#ff6b6b','#ffd93d','#6bcb77']
+print("Setup complete")
+Setup complete
+# ── Pull Data ─────────────────────────────────────────────
+query = """
+SELECT
+    COUNT(DISTINCT order_id)                              AS total_orders,
+    SUM(CASE WHEN order_status != 'canceled'
+             THEN 1 ELSE 0 END)                          AS approved,
+    SUM(CASE WHEN order_status IN ('shipped','delivered')
+             THEN 1 ELSE 0 END)                          AS shipped,
+    SUM(CASE WHEN order_status = 'delivered'
+             THEN 1 ELSE 0 END)                          AS delivered
+FROM ecommerce_master
+"""
+df = pd.read_sql(query, engine)
+
+stages = ['Order Placed', 'Approved', 'Shipped', 'Delivered']
+values = [
+    df['total_orders'].iloc[0],
+    df['approved'].iloc[0],
+    df['shipped'].iloc[0],
+    df['delivered'].iloc[0]
+]
+
+# ── Plot ──────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(12, 6))
+fig.patch.set_facecolor('#0f1117')
+
+bar_colors = ['#00d4ff','#7b61ff','#ff6b6b','#6bcb77']
+bars = ax.barh(stages[::-1], values[::-1],
+               color=bar_colors, height=0.5, edgecolor='none')
+
+# Add value labels
+for bar, val in zip(bars, values[::-1]):
+    ax.text(bar.get_width() + 500, bar.get_y() + bar.get_height()/2,
+            f'{val:,}', va='center', fontsize=11, color='white')
+
+# Add drop-off annotations
+for i in range(len(values)-1):
+    drop_pct = (values[i] - values[i+1]) / values[i] * 100
+    ax.text(values[i+1]/2,
+            len(stages) - i - 2 + 0.35,
+            f'▼ {drop_pct:.1f}% drop-off',
+            fontsize=9, color='#ff6b6b', ha='center')
+
+ax.set_xlabel('Number of Orders', color='white')
+ax.set_title('🛒 E-Commerce Conversion Funnel',
+             fontsize=16, fontweight='bold', pad=20, color='white')
+ax.grid(axis='x', alpha=0.3)
+plt.tight_layout()
+plt.savefig(os.path.join(VISUALS, '01_funnel_chart.png'),
+            dpi=150, bbox_inches='tight')
+plt.show()
+print("Funnel chart saved")
+C:\Users\SHILAJEET23\AppData\Local\Temp\ipykernel_29312\535649212.py:48: UserWarning: Glyph 128722 (\N{SHOPPING TROLLEY}) missing from font(s) DejaVu Sans.
+  plt.tight_layout()
+C:\Users\SHILAJEET23\AppData\Local\Temp\ipykernel_29312\535649212.py:49: UserWarning: Glyph 128722 (\N{SHOPPING TROLLEY}) missing from font(s) DejaVu Sans.
+  plt.savefig(os.path.join(VISUALS, '01_funnel_chart.png'),
+D:\Anaconda\Lib\site-packages\IPython\core\pylabtools.py:170: UserWarning: Glyph 128722 (\N{SHOPPING TROLLEY}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+No description has been provided for this image
+Funnel chart saved
+query = """
+WITH monthly AS (
+    SELECT
+        DATE_FORMAT(order_purchase_timestamp, '%%Y-%%m') AS month,
+        ROUND(SUM(total_payment), 2)                   AS revenue,
+        COUNT(DISTINCT order_id)                      AS orders
+    FROM ecommerce_master
+    WHERE order_status = 'delivered'
+    GROUP BY 1
+)
+SELECT 
+    month, 
+    revenue, 
+    orders,
+    ROUND((revenue - LAG(revenue) OVER (ORDER BY month)) /
+          NULLIF(LAG(revenue) OVER (ORDER BY month), 0) * 100, 2) AS mom_growth
+FROM monthly
+ORDER BY month
+"""
+
+df = pd.read_sql(query, engine)
+print("✅ Data loaded:", df.shape)
+
+# ── Plot ──────────────────────────────────────────────────
+VISUALS = "visuals"  # Update this path as needed
+os.makedirs(VISUALS, exist_ok=True)
+
+fig, ax1 = plt.subplots(figsize=(14, 6))
+fig.patch.set_facecolor('#0f1117')
+
+# Revenue line (primary axis)
+ax1.plot(df['month'], df['revenue'],
+         color='#00d4ff', linewidth=2.5, marker='o', markersize=5)
+ax1.fill_between(df['month'], df['revenue'],
+                 alpha=0.15, color='#00d4ff')
+ax1.set_ylabel('Revenue (BRL)', color='#00d4ff', fontsize=12)
+ax1.tick_params(axis='y', colors='#00d4ff')
+ax1.yaxis.set_major_formatter(
+    mticker.FuncFormatter(lambda x, _: f'R${x/1000:.0f}K'))
+
+# MoM growth bars (secondary axis)
+ax2 = ax1.twinx()
+colors = ['#6bcb77' if x >= 0 else '#ff6b6b'
+          for x in df['mom_growth'].fillna(0)]
+ax2.bar(df['month'], df['mom_growth'].fillna(0),
+        color=colors, alpha=0.4, width=0.4)
+ax2.set_ylabel('MoM Growth %', color='#ffd93d', fontsize=12)
+ax2.tick_params(axis='y', colors='#ffd93d')
+ax2.axhline(0, color='white', linewidth=0.5, linestyle='--')
+
+# Styling
+plt.xticks(rotation=45, ha='right')
+plt.title('📈 Monthly Revenue Trend & MoM Growth',
+          fontsize=16, fontweight='bold', pad=20, color='white')
+plt.tight_layout()
+
+# Save and show
+plt.savefig(os.path.join(VISUALS, 'filename.png'), 
+            dpi=150, bbox_inches='tight', facecolor='#0f1117')
+plt.show()
+
+print("MoM revenue chart saved ")
+print(df)
+✅ Data loaded: (23, 4)
+C:\Users\SHILAJEET23\AppData\Local\Temp\ipykernel_29312\35213035.py:55: UserWarning: Glyph 128200 (\N{CHART WITH UPWARDS TREND}) missing from font(s) DejaVu Sans.
+  plt.tight_layout()
+C:\Users\SHILAJEET23\AppData\Local\Temp\ipykernel_29312\35213035.py:58: UserWarning: Glyph 128200 (\N{CHART WITH UPWARDS TREND}) missing from font(s) DejaVu Sans.
+  plt.savefig(os.path.join(VISUALS, 'filename.png'),
+D:\Anaconda\Lib\site-packages\IPython\core\pylabtools.py:170: UserWarning: Glyph 128200 (\N{CHART WITH UPWARDS TREND}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+No description has been provided for this image
+MoM revenue chart saved 
+      month     revenue  orders  mom_growth
+0   2016-09         NaN       1         NaN
+1   2016-10    62134.03     265         NaN
+2   2016-12       19.62       1      -99.97
+3   2017-01   177199.49     750   903057.44
+4   2017-02   327153.94    1653       84.62
+5   2017-03   506862.29    2546       54.93
+6   2017-04   456574.29    2303       -9.92
+7   2017-05   704252.35    3546       54.25
+8   2017-06   587400.65    3135      -16.59
+9   2017-07   717950.22    3872       22.22
+10  2017-08   847386.99    4193       18.03
+11  2017-09  1002507.55    4150       18.31
+12  2017-10  1009688.73    4478        0.72
+13  2017-11  1552379.23    7289       53.75
+14  2017-12  1021776.55    5513      -34.18
+15  2018-01  1375595.89    7069       34.63
+16  2018-02  1286692.50    6555       -6.46
+17  2018-03  1439190.71    7003       11.85
+18  2018-04  1468186.20    6798        2.01
+19  2018-05  1480841.48    6749        0.86
+20  2018-06  1286705.05    6099      -13.11
+21  2018-07  1308749.16    6159        1.71
+22  2018-08  1211284.54    6351       -7.45
+# ── Pull Data ─────────────────────────────────────────────
+query = """
+SELECT
+    product_category_name       AS category,
+    ROUND(SUM(total_payment),2) AS revenue,
+    COUNT(DISTINCT order_id)    AS orders,
+    ROUND(AVG(total_payment),2) AS aov
+FROM ecommerce_master
+WHERE order_status = 'delivered'
+  AND product_category_name IS NOT NULL
+GROUP BY product_category_name
+ORDER BY revenue DESC
+LIMIT 10
+"""
+df = pd.read_sql(query, engine)
+
+# ── Plot ──────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+fig.patch.set_facecolor('#0f1117')
+
+# Revenue bar
+axes[0].barh(df['category'][::-1], df['revenue'][::-1],
+             color='#00d4ff', edgecolor='none')
+axes[0].set_title('Revenue by Category', color='white', fontsize=13)
+axes[0].set_xlabel('Revenue (BRL)', color='white')
+axes[0].xaxis.set_major_formatter(
+    mticker.FuncFormatter(lambda x, _: f'R${x/1000:.0f}K'))
+
+# Add value labels
+for i, (val, cat) in enumerate(zip(df['revenue'][::-1],
+                                    df['category'][::-1])):
+    axes[0].text(val + 1000, i, f'R${val/1000:.0f}K',
+                 va='center', fontsize=9, color='white')
+
+# AOV bar
+axes[1].barh(df['category'][::-1], df['aov'][::-1],
+             color='#7b61ff', edgecolor='none')
+axes[1].set_title('Avg Order Value by Category',
+                  color='white', fontsize=13)
+axes[1].set_xlabel('AOV (BRL)', color='white')
+
+for ax in axes:
+    ax.set_facecolor('#0f1117')
+    ax.tick_params(colors='white')
+    ax.grid(axis='x', alpha=0.3)
+
+plt.suptitle('🏆 Top 10 Product Categories',
+             fontsize=16, fontweight='bold', color='white', y=1.02)
+plt.tight_layout()
+plt.savefig(os.path.join(VISUALS, '03_top_categories.png'),
+            dpi=150, bbox_inches='tight')
+plt.show()
+print(" Top categories chart saved")
+C:\Users\SHILAJEET23\AppData\Local\Temp\ipykernel_29312\3274627214.py:49: UserWarning: Glyph 127942 (\N{TROPHY}) missing from font(s) DejaVu Sans.
+  plt.tight_layout()
+C:\Users\SHILAJEET23\AppData\Local\Temp\ipykernel_29312\3274627214.py:50: UserWarning: Glyph 127942 (\N{TROPHY}) missing from font(s) DejaVu Sans.
+  plt.savefig(os.path.join(VISUALS, '03_top_categories.png'),
+D:\Anaconda\Lib\site-packages\IPython\core\pylabtools.py:170: UserWarning: Glyph 127942 (\N{TROPHY}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+No description has been provided for this image
+ Top categories chart saved
+# ── Pull Data ─────────────────────────────────────────────
+query = """
+SELECT
+    YEAR(order_purchase_timestamp)    AS year,
+    QUARTER(order_purchase_timestamp) AS quarter,
+    CONCAT('Q', QUARTER(order_purchase_timestamp),
+           '-', YEAR(order_purchase_timestamp)) AS period,
+    COUNT(DISTINCT order_id)          AS orders,
+    ROUND(SUM(total_payment),2)       AS revenue
+FROM ecommerce_master
+WHERE order_status = 'delivered'
+GROUP BY year, quarter,
+         CONCAT('Q', QUARTER(order_purchase_timestamp),
+                '-', YEAR(order_purchase_timestamp))
+ORDER BY year, quarter
+"""
+df = pd.read_sql(query, engine)
+
+# ── Plot ──────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(14, 6))
+fig.patch.set_facecolor('#0f1117')
+
+quarter_colors = {1:'#00d4ff', 2:'#6bcb77', 3:'#ffd93d', 4:'#ff6b6b'}
+bar_colors = [quarter_colors[q] for q in df['quarter']]
+
+bars = ax.bar(df['period'], df['revenue'],
+              color=bar_colors, edgecolor='none', width=0.6)
+
+# Value labels on bars
+for bar, val in zip(bars, df['revenue']):
+    ax.text(bar.get_x() + bar.get_width()/2,
+            bar.get_height() + 5000,
+            f'R${val/1000:.0f}K',
+            ha='center', fontsize=8, color='white')
+
+ax.set_title('Quarterly Revenue Seasonality',
+             fontsize=16, fontweight='bold', color='white', pad=20)
+ax.set_ylabel('Revenue (BRL)', color='white')
+ax.yaxis.set_major_formatter(
+    mticker.FuncFormatter(lambda x, _: f'R${x/1000:.0f}K'))
+plt.xticks(rotation=45, ha='right')
+ax.grid(axis='y', alpha=0.3)
+
+# Legend
+from matplotlib.patches import Patch
+legend = [Patch(color=v, label=f'Q{k}') for k, v in quarter_colors.items()]
+ax.legend(handles=legend, loc='upper left')
+
+plt.tight_layout()
+plt.savefig(os.path.join(VISUALS, '04_quarterly_seasonality.png'),
+            dpi=150, bbox_inches='tight')
+plt.show()
+print("Seasonality chart saved")
+posx and posy should be finite values
+posx and posy should be finite values
+posx and posy should be finite values
+posx and posy should be finite values
+posx and posy should be finite values
+No description has been provided for this image
+Seasonality chart saved
+# ── Pull Data ─────────────────────────────────────────────
+query = """
+WITH customer_orders AS (
+    SELECT 
+        customer_unique_id,
+        COUNT(DISTINCT order_id) AS total_orders,
+        ROUND(SUM(total_payment),2) AS lifetime_value
+    FROM ecommerce_master99
+    WHERE order_status = 'delivered'
+    GROUP BY customer_unique_id
+)
+SELECT
+    COUNT(*) AS total_customers,
+    SUM(CASE WHEN total_orders = 1 THEN 1 ELSE 0 END) AS one_time,
+    SUM(CASE WHEN total_orders > 1 THEN 1 ELSE 0 END) AS repeat_customers,
+    ROUND(AVG(lifetime_value),2) AS avg_ltv,
+    ROUND(AVG(CASE WHEN total_orders > 1 THEN lifetime_value END),2) AS repeat_ltv
+FROM customer_orders
+"""
+df = pd.read_sql(query, engine)
+print("✅ Customer data loaded:", df.head())
+
+# ── Your plotting code stays EXACTLY the same ──────────────
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+fig.patch.set_facecolor('#0f1117')
+
+# Donut chart
+sizes  = [df['one_time'].iloc[0], df['repeat_customers'].iloc[0]]
+labels = ['One-Time Buyers', 'Repeat Buyers']
+colors = ['#ff6b6b', '#6bcb77']
+
+wedges, texts, autotexts = axes[0].pie(
+    sizes, labels=labels, colors=colors,
+    autopct='%1.1f%%', startangle=90,
+    wedgeprops=dict(width=0.5),
+    textprops={'color':'white'}
+)
+for at in autotexts:
+    at.set_fontsize(13)
+    at.set_fontweight('bold')
+
+axes[0].set_title('Customer Type Distribution', color='white', fontsize=13)
+
+# LTV comparison
+ltv_labels = ['Avg All Customers', 'Repeat Buyers Only']
+ltv_values = [df['avg_ltv'].iloc[0], df['repeat_ltv'].iloc[0]]
+bars = axes[1].bar(ltv_labels, ltv_values,
+                   color=['#7b61ff','#00d4ff'],
+                   edgecolor='none', width=0.4)
+
+for bar, val in zip(bars, ltv_values):
+    axes[1].text(bar.get_x() + bar.get_width()/2,
+                 bar.get_height() + 2,
+                 f'R${val:.0f}',
+                 ha='center', fontsize=12,
+                 color='white', fontweight='bold')
+
+axes[1].set_title('Avg LTV: All vs Repeat Buyers',
+                  color='white', fontsize=13)
+axes[1].set_ylabel('Lifetime Value (BRL)', color='white')
+axes[1].set_facecolor('#0f1117')
+axes[1].grid(axis='y', alpha=0.3)
+
+plt.suptitle('👥 Customer Retention Analysis',
+             fontsize=16, fontweight='bold', color='white')
+plt.tight_layout()
+plt.savefig(os.path.join(VISUALS, '05_customer_retention.png'),
+            dpi=150, bbox_inches='tight', facecolor='#0f1117')
+plt.show()
+print("Customer retention chart saved")
+✅ Customer data loaded:    total_customers  one_time  repeat_customers  avg_ltv  repeat_ltv
+0            93358   90557.0            2801.0   212.42      468.21
+C:\Users\SHILAJEET23\AppData\Local\Temp\ipykernel_29312\2896096773.py:66: UserWarning: Glyph 128101 (\N{BUSTS IN SILHOUETTE}) missing from font(s) DejaVu Sans.
+  plt.tight_layout()
+C:\Users\SHILAJEET23\AppData\Local\Temp\ipykernel_29312\2896096773.py:67: UserWarning: Glyph 128101 (\N{BUSTS IN SILHOUETTE}) missing from font(s) DejaVu Sans.
+  plt.savefig(os.path.join(VISUALS, '05_customer_retention.png'),
+D:\Anaconda\Lib\site-packages\IPython\core\pylabtools.py:170: UserWarning: Glyph 128101 (\N{BUSTS IN SILHOUETTE}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+No description has been provided for this image
+Customer retention chart saved
+# ── Pull Data ─────────────────────────────────────────────
+query = """
+WITH cohorts AS (
+    SELECT 
+        customer_unique_id,
+        DATE_FORMAT(MIN(order_purchase_timestamp), '%%Y-%%m') AS cohort_month,
+        COUNT(DISTINCT order_id) AS total_orders
+    FROM ecommerce_master99
+    WHERE order_status = 'delivered'
+    GROUP BY customer_unique_id
+),
+cohort_metrics AS (
+    SELECT 
+        cohort_month,
+        COUNT(DISTINCT customer_unique_id) AS cohort_size,
+        COUNT(DISTINCT CASE WHEN total_orders > 1 THEN customer_unique_id END) AS retained_customers
+    FROM cohorts
+    GROUP BY cohort_month
+)
+SELECT 
+    cohort_month,
+    cohort_size,
+    retained_customers,
+    ROUND((retained_customers * 100.0 / cohort_size), 1) AS retention_rate
+FROM cohort_metrics
+ORDER BY cohort_month
+"""
+df = pd.read_sql(query, engine)
+df = df[df['cohort_month'] >= '2017-01']
+print("✅ Cohort data loaded:", df.head())
+
+# ── Plot ──────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(12, 8))
+fig.patch.set_facecolor('#0f1117')
+
+# Retention heatmap style bars
+colors = ['#ff6b6b', '#6bcb77']
+bars = ax.bar(df['cohort_month'], df['retention_rate'], 
+              color=colors[1], alpha=0.8, edgecolor='white', linewidth=1)
+
+ax.set_ylabel('Retention Rate %', color='white', fontsize=12)
+ax.set_title('📊 Customer Cohort Retention Analysis', 
+             color='white', fontsize=16, fontweight='bold', pad=20)
+ax.tick_params(colors='white')
+ax.set_facecolor('#0f1117')
+ax.grid(axis='y', alpha=0.3)
+
+# Add value labels on bars
+for bar, rate in zip(bars, df['retention_rate']):
+    height = bar.get_height()
+    ax.text(bar.get_x() + bar.get_width()/2., height + 1,
+            f'{rate}%', ha='center', va='bottom', 
+            fontweight='bold', color='white', fontsize=11)
+
+plt.xticks(rotation=45, ha='right')
+plt.tight_layout()
+plt.savefig(os.path.join(VISUALS, '06_cohort_retention.png'),
+            dpi=150, bbox_inches='tight', facecolor='#0f1117')
+plt.show()
+print("Cohort retention chart saved")
+✅ Cohort data loaded:   cohort_month  cohort_size  retained_customers  retention_rate
+3      2017-01          717                  52             7.3
+4      2017-02         1628                  66             4.1
+5      2017-03         2503                 121             4.8
+6      2017-04         2256                 102             4.5
+7      2017-05         3451                 182             5.3
+C:\Users\SHILAJEET23\AppData\Local\Temp\ipykernel_29312\128351281.py:56: UserWarning: Glyph 128202 (\N{BAR CHART}) missing from font(s) DejaVu Sans.
+  plt.tight_layout()
+C:\Users\SHILAJEET23\AppData\Local\Temp\ipykernel_29312\128351281.py:57: UserWarning: Glyph 128202 (\N{BAR CHART}) missing from font(s) DejaVu Sans.
+  plt.savefig(os.path.join(VISUALS, '06_cohort_retention.png'),
+D:\Anaconda\Lib\site-packages\IPython\core\pylabtools.py:170: UserWarning: Glyph 128202 (\N{BAR CHART}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+No description has been provided for this image
+Cohort retention chart saved
+# ── Pull Data ─────────────────────────────────────────────
+query = """
+SELECT payment_types                  AS payment_method,
+       COUNT(DISTINCT order_id)       AS total_orders,
+       ROUND(SUM(total_payment),2)    AS total_revenue,
+       ROUND(AVG(total_payment),2)    AS avg_order_value,
+       ROUND(AVG(installments),1)     AS avg_installments
+FROM ecommerce_master99
+WHERE order_status = 'delivered'
+  AND payment_types IS NOT NULL
+GROUP BY payment_types
+ORDER BY avg_order_value DESC
+"""
+df = pd.read_sql(query, engine)
+
+# ── Plot ──────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(16, 6))
+fig.patch.set_facecolor('#0f1117')
+
+metrics = [
+    ('avg_order_value', 'Avg Order Value (BRL)', '#00d4ff'),
+    ('total_orders',    'Total Orders',          '#7b61ff'),
+    ('avg_installments','Avg Installments',       '#ffd93d')
+]
+
+for ax, (col, title, color) in zip(axes, metrics):
+    bars = ax.bar(df['payment_method'], df[col],
+                  color=color, edgecolor='none', width=0.5)
+    ax.set_title(title, color='white', fontsize=12)
+    ax.set_facecolor('#0f1117')
+    ax.tick_params(colors='white')
+    ax.grid(axis='y', alpha=0.3)
+    plt.setp(ax.get_xticklabels(), rotation=20, ha='right')
+
+    for bar, val in zip(bars, df[col]):
+        ax.text(bar.get_x() + bar.get_width()/2,
+                bar.get_height() + max(df[col]) * 0.01,
+                f'{val:,.0f}',
+                ha='center', fontsize=9, color='white')
+
+plt.suptitle('💳 Payment Method Performance',
+             fontsize=16, fontweight='bold', color='white')
+plt.tight_layout()
+plt.savefig(os.path.join(VISUALS, '07_payment_analysis.png'),
+            dpi=150, bbox_inches='tight')
+plt.show()
+print("Payment analysis chart saved")
+C:\Users\SHILAJEET23\AppData\Local\Temp\ipykernel_29312\548996972.py:43: UserWarning: Glyph 128179 (\N{CREDIT CARD}) missing from font(s) DejaVu Sans.
+  plt.tight_layout()
+C:\Users\SHILAJEET23\AppData\Local\Temp\ipykernel_29312\548996972.py:44: UserWarning: Glyph 128179 (\N{CREDIT CARD}) missing from font(s) DejaVu Sans.
+  plt.savefig(os.path.join(VISUALS, '07_payment_analysis.png'),
+D:\Anaconda\Lib\site-packages\IPython\core\pylabtools.py:170: UserWarning: Glyph 128179 (\N{CREDIT CARD}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+No description has been provided for this image
+Payment analysis chart saved
+# ── Pull Data ─────────────────────────────────────────────
+query = """
+SELECT product_category_name                              AS category,
+       COUNT(DISTINCT order_id)                           AS total_orders,
+       SUM(CASE WHEN order_status = 'canceled'
+                THEN 1 ELSE 0 END)                        AS cancelled,
+       ROUND(SUM(CASE WHEN order_status = 'canceled'
+                 THEN 1 ELSE 0 END)
+                 / COUNT(*) * 100, 2)                     AS cancel_rate
+FROM ecommerce_master99
+WHERE product_category_name IS NOT NULL
+GROUP BY product_category_name
+HAVING total_orders > 100
+ORDER BY cancel_rate DESC
+LIMIT 12
+"""
+df = pd.read_sql(query, engine)
+
+# ── Plot ──────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(13, 7))
+fig.patch.set_facecolor('#0f1117')
+
+bar_colors = ['#ff6b6b' if x > df['cancel_rate'].mean()
+              else '#6bcb77' for x in df['cancel_rate']]
+
+bars = ax.barh(df['category'][::-1], df['cancel_rate'][::-1],
+               color=bar_colors[::-1], edgecolor='none')
+
+ax.axvline(df['cancel_rate'].mean(), color='#ffd93d',
+           linestyle='--', linewidth=1.5,
+           label=f"Avg: {df['cancel_rate'].mean():.1f}%")
+
+for bar, val in zip(bars, df['cancel_rate'][::-1]):
+    ax.text(val + 0.05, bar.get_y() + bar.get_height()/2,
+            f'{val:.1f}%', va='center', fontsize=9, color='white')
+
+ax.set_title('🚫 Cancellation Rate by Product Category',
+             fontsize=16, fontweight='bold', color='white', pad=20)
+ax.set_xlabel('Cancellation Rate %', color='white')
+ax.set_facecolor('#0f1117')
+ax.legend(facecolor='#1a1a2e', labelcolor='white')
+ax.grid(axis='x', alpha=0.3)
+plt.tight_layout()
+plt.savefig(os.path.join(VISUALS, '08_cancellation_rate.png'),
+            dpi=150, bbox_inches='tight')
+plt.show()
+print("Cancellation chart saved")
+C:\Users\SHILAJEET23\AppData\Local\Temp\ipykernel_29312\1413708600.py:43: UserWarning: Glyph 128683 (\N{NO ENTRY SIGN}) missing from font(s) DejaVu Sans.
+  plt.tight_layout()
+C:\Users\SHILAJEET23\AppData\Local\Temp\ipykernel_29312\1413708600.py:44: UserWarning: Glyph 128683 (\N{NO ENTRY SIGN}) missing from font(s) DejaVu Sans.
+  plt.savefig(os.path.join(VISUALS, '08_cancellation_rate.png'),
+D:\Anaconda\Lib\site-packages\IPython\core\pylabtools.py:170: UserWarning: Glyph 128683 (\N{NO ENTRY SIGN}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+No description has been provided for this image
+Cancellation chart saved
+# ── Pull Data ─────────────────────────────────────────────
+query = """
+WITH delivery_data AS (
+    SELECT
+        CASE
+            WHEN order_delivered_customer_date <= order_estimated_delivery_date THEN 'On Time'
+            WHEN order_delivered_customer_date > order_estimated_delivery_date THEN 'Late'
+            ELSE 'Not Delivered'
+        END AS delivery_status,
+        review_score,
+        total_payment
+    FROM ecommerce_master99  
+    WHERE order_status = 'delivered'  -- Fixed WHERE condition
+)
+SELECT
+    delivery_status,
+    COUNT(*) AS orders,
+    ROUND(AVG(review_score),2) AS avg_review,
+    ROUND(AVG(total_payment),2) AS avg_order_value
+FROM delivery_data
+GROUP BY delivery_status
+"""
+df = pd.read_sql(query, engine)
+print("✅ Delivery data loaded:", df.head())
+
+# ── Plot (Your code is perfect!) ───────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(16, 6))
+fig.patch.set_facecolor('#0f1117')
+
+colors = {'On Time':'#6bcb77','Late':'#ff6b6b','Not Delivered':'#ffd93d'}
+bar_colors = [colors.get(s, '#7b61ff') for s in df['delivery_status']]
+
+# Orders donut
+axes[0].pie(df['orders'], labels=df['delivery_status'],
+            colors=bar_colors, autopct='%1.1f%%',
+            startangle=90, wedgeprops=dict(width=0.5),
+            textprops={'color':'white'})
+axes[0].set_title('Delivery Status Split', color='white')
+
+# Avg review score
+axes[1].bar(df['delivery_status'], df['avg_review'],
+            color=bar_colors, edgecolor='none', width=0.4)
+axes[1].set_title('Avg Review Score', color='white')
+axes[1].set_ylabel('Score (1-5)', color='white')
+axes[1].set_ylim(0, 5)
+axes[1].set_facecolor('#0f1117')
+for bar, val in zip(axes[1].patches, df['avg_review']):
+    axes[1].text(bar.get_x() + bar.get_width()/2,
+                 bar.get_height() + 0.05,
+                 f'{val:.2f}', ha='center',
+                 fontsize=12, color='white', fontweight='bold')
+
+# AOV comparison
+axes[2].bar(df['delivery_status'], df['avg_order_value'],
+            color=bar_colors, edgecolor='none', width=0.4)
+axes[2].set_title('Avg Order Value', color='white')
+axes[2].set_ylabel('AOV (BRL)', color='white')
+axes[2].set_facecolor('#0f1117')
+
+for ax in axes[1:]:
+    ax.tick_params(colors='white')
+    ax.grid(axis='y', alpha=0.3)
+
+plt.suptitle('🚚 Delivery Performance Analysis',
+             fontsize=16, fontweight='bold', color='white')
+plt.tight_layout()
+plt.savefig(os.path.join(VISUALS, '09_delivery_performance.png'),
+            dpi=150, bbox_inches='tight', facecolor='#0f1117')
+plt.show()
+print("Delivery chart saved")
+✅ Delivery data loaded:   delivery_status  orders  avg_review  avg_order_value
+0         On Time  101758        4.21           178.98
+1            Late    8735        2.55           185.32
+C:\Users\SHILAJEET23\AppData\Local\Temp\ipykernel_29312\739211213.py:66: UserWarning: Glyph 128666 (\N{DELIVERY TRUCK}) missing from font(s) DejaVu Sans.
+  plt.tight_layout()
+C:\Users\SHILAJEET23\AppData\Local\Temp\ipykernel_29312\739211213.py:67: UserWarning: Glyph 128666 (\N{DELIVERY TRUCK}) missing from font(s) DejaVu Sans.
+  plt.savefig(os.path.join(VISUALS, '09_delivery_performance.png'),
+D:\Anaconda\Lib\site-packages\IPython\core\pylabtools.py:170: UserWarning: Glyph 128666 (\N{DELIVERY TRUCK}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+No description has been provided for this image
+Delivery chart saved
+# ── Pull Data ─────────────────────────────────────────────
+query = """
+SELECT
+    CASE
+        WHEN DATEDIFF(order_delivered_customer_date,
+                      order_estimated_delivery_date) <= 0
+             THEN '1. On Time / Early'
+        WHEN DATEDIFF(order_delivered_customer_date,
+                      order_estimated_delivery_date)
+             BETWEEN 1 AND 7   THEN '2. Late 1-7 days'
+        WHEN DATEDIFF(order_delivered_customer_date,
+                      order_estimated_delivery_date)
+             BETWEEN 8 AND 14  THEN '3. Late 8-14 days'
+        WHEN DATEDIFF(order_delivered_customer_date,
+                      order_estimated_delivery_date)
+             BETWEEN 15 AND 30 THEN '4. Late 15-30 days'
+        ELSE                        '5. Very Late 30+ days'
+    END                              AS lateness_bucket,
+    COUNT(*)                         AS orders,
+    ROUND(AVG(review_score),2)       AS avg_review,
+    ROUND(SUM(CASE WHEN review_score <= 2
+              THEN 1 ELSE 0 END)
+              / COUNT(*) * 100, 2)   AS dissatisfied_pct,
+    ROUND(SUM(CASE WHEN review_score >= 4
+              THEN 1 ELSE 0 END)
+              / COUNT(*) * 100, 2)   AS satisfied_pct
+FROM ecommerce_master
+WHERE delivery_status = 'delivered'
+  AND review_score IS NOT NULL
+GROUP BY lateness_bucket
+ORDER BY lateness_bucket
+"""
+df = pd.read_sql(query, engine)
+
+# ── Plot ──────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+fig.patch.set_facecolor('#0f1117')
+
+# Avg review score by lateness
+colors = ['#6bcb77','#ffd93d','#ff9f43','#ff6b6b','#c0392b']
+bars = axes[0].bar(df['lateness_bucket'], df['avg_review'],
+                   color=colors, edgecolor='none', width=0.5)
+axes[0].set_title('Avg Review Score by Delivery Lateness',
+                  color='white', fontsize=12)
+axes[0].set_ylabel('Avg Review Score', color='white')
+axes[0].set_ylim(0, 5)
+axes[0].set_facecolor('#0f1117')
+plt.setp(axes[0].get_xticklabels(), rotation=20, ha='right', fontsize=9)
+for bar, val in zip(bars, df['avg_review']):
+    axes[0].text(bar.get_x() + bar.get_width()/2,
+                 bar.get_height() + 0.05,
+                 f'{val:.2f}', ha='center',
+                 fontsize=10, color='white', fontweight='bold')
+
+# Satisfied vs Dissatisfied stacked
+x = range(len(df))
+axes[1].bar(x, df['satisfied_pct'],
+            color='#6bcb77', label='Satisfied (4-5★)', edgecolor='none')
+axes[1].bar(x, df['dissatisfied_pct'],
+            bottom=df['satisfied_pct'],
+            color='#ff6b6b', label='Dissatisfied (1-2★)', edgecolor='none')
+axes[1].set_xticks(list(x))
+axes[1].set_xticklabels(df['lateness_bucket'],
+                         rotation=20, ha='right', fontsize=9)
+axes[1].set_title('Satisfied vs Dissatisfied %',
+                  color='white', fontsize=12)
+axes[1].set_ylabel('Percentage %', color='white')
+axes[1].set_facecolor('#0f1117')
+axes[1].legend(facecolor='#1a1a2e', labelcolor='white')
+
+for ax in axes:
+    ax.tick_params(colors='white')
+    ax.grid(axis='y', alpha=0.3)
+
+plt.suptitle('⭐ Delivery Lateness vs Customer Satisfaction',
+             fontsize=16, fontweight='bold', color='white')
+plt.tight_layout()
+plt.savefig(os.path.join(VISUALS, '10_lateness_vs_satisfaction.png'),
+            dpi=150, bbox_inches='tight')
+plt.show()
+print("Satisfaction chart saved")
+C:\Users\SHILAJEET23\AppData\Local\Temp\ipykernel_29312\1403738842.py:77: UserWarning: Glyph 11088 (\N{WHITE MEDIUM STAR}) missing from font(s) DejaVu Sans.
+  plt.tight_layout()
+C:\Users\SHILAJEET23\AppData\Local\Temp\ipykernel_29312\1403738842.py:78: UserWarning: Glyph 11088 (\N{WHITE MEDIUM STAR}) missing from font(s) DejaVu Sans.
+  plt.savefig(os.path.join(VISUALS, '10_lateness_vs_satisfaction.png'),
+D:\Anaconda\Lib\site-packages\IPython\core\pylabtools.py:170: UserWarning: Glyph 11088 (\N{WHITE MEDIUM STAR}) missing from font(s) DejaVu Sans.
+  fig.canvas.print_figure(bytes_io, **kw)
+No description has been provided for this image
+Satisfaction chart saved
+# ── Confirm all visuals saved ─────────────────────────────
+saved = os.listdir(VISUALS)
+print("=" * 50)
+print("     ALL VISUALIZATIONS COMPLETE")
+print("=" * 50)
+for f in sorted(saved):
+    print(f"  ✅ {f}")
+print(f"\nTotal : {len(saved)} charts saved")
+print(f"Path  : {VISUALS}")
+==================================================
+     ALL VISUALIZATIONS COMPLETE
+==================================================
+  ✅ 02_mom_revenue_trend.png
+  ✅ 03_top_categories.png
+  ✅ 04_quarterly_seasonality.png
+  ✅ 05_customer_retention.png
+  ✅ 06_cohort_retention.png
+  ✅ 07_payment_analysis.png
+  ✅ 08_cancellation_rate.png
+  ✅ 09_delivery_performance.png
+  ✅ 10_lateness_vs_satisfaction.png
+  ✅ outliers_before.png
+
+Total : 10 charts saved
+Path  : visuals
+queries = {
+    '01_monthly_revenue': """
+    WITH monthly AS (
+        SELECT
+            DATE_FORMAT(order_purchase_timestamp, '%%Y-%%m') AS month,
+            ROUND(SUM(total_payment),2) AS revenue,
+            COUNT(DISTINCT order_id) AS orders
+        FROM ecommerce_masster99
+        WHERE order_status = 'delivered'
+        GROUP BY 1
+    )
+    SELECT month, revenue, orders,
+           ROUND((revenue - LAG(revenue) OVER (ORDER BY month)) /
+                  NULLIF(LAG(revenue) OVER (ORDER BY month), 0) * 100, 2) AS mom_growth
+    FROM monthly
+    ORDER BY month
+    """,
+
+    '02_customer_retention': """
+    WITH customer_orders AS (
+        SELECT customer_unique_id,
+               COUNT(DISTINCT order_id) AS total_orders,
+               ROUND(SUM(total_payment),2) AS lifetime_value
+        FROM ecommerce_masster99
+        WHERE order_status = 'delivered'
+        GROUP BY customer_unique_id
+    )
+    SELECT
+        COUNT(*) AS total_customers,
+        SUM(CASE WHEN total_orders = 1 THEN 1 ELSE 0 END) AS one_time,
+        SUM(CASE WHEN total_orders > 1 THEN 1 ELSE 0 END) AS repeat_customers,
+        ROUND(AVG(lifetime_value),2) AS avg_ltv,
+        ROUND(AVG(CASE WHEN total_orders > 1 THEN lifetime_value END),2) AS repeat_ltv
+    FROM customer_orders
+    """,
+
+    '03_cohort_retention': """
+    WITH cohorts AS (
+        SELECT customer_unique_id,
+               DATE_FORMAT(MIN(order_purchase_timestamp), '%%Y-%%m') AS cohort_month,
+               COUNT(DISTINCT order_id) AS total_orders
+        FROM ecommerce_masster99
+        WHERE order_status = 'delivered'
+        GROUP BY customer_unique_id
+    )
+    SELECT cohort_month,
+           COUNT(DISTINCT customer_unique_id) AS cohort_size,
+           COUNT(DISTINCT CASE WHEN total_orders > 1 THEN customer_unique_id END) AS retained,
+           ROUND(COUNT(DISTINCT CASE WHEN total_orders > 1 THEN customer_unique_id END) * 100.0 /
+                 COUNT(DISTINCT customer_unique_id), 1) AS retention_rate
+    FROM cohorts
+    GROUP BY cohort_month
+    ORDER BY cohort_month
+    """,
+
+    '04_delivery_performance': """
+    WITH delivery_data AS (
+        SELECT CASE
+            WHEN order_delivered_customer_date <= order_estimated_delivery_date THEN 'On Time'
+            WHEN order_delivered_customer_date > order_estimated_delivery_date THEN 'Late'
+            ELSE 'Not Delivered'
+        END AS delivery_status,
+           review_score,
+           total_payment
+        FROM ecommerce_masster99
+        WHERE order_status = 'delivered'
+    )
+    SELECT delivery_status,
+           COUNT(*) AS orders,
+           ROUND(AVG(review_score),2) AS avg_review,
+           ROUND(AVG(total_payment),2) AS avg_order_value
+    FROM delivery_data
+    GROUP BY delivery_status
+    """,
+
+    '05_top_products': """
+    SELECT product_category_name,
+           COUNT(DISTINCT order_id) AS total_orders,
+           ROUND(SUM(total_payment),2) AS total_revenue,
+           ROUND(AVG(total_payment),2) AS avg_order_value,
+           COUNT(DISTINCT customer_unique_id) AS unique_buyers
+    FROM ecommerce_masster99
+    WHERE order_status = 'delivered'
+    GROUP BY product_category_name
+    ORDER BY total_revenue DESC
+    LIMIT 10
+    """,
+
+    '06_review_analysis': """
+    SELECT review_score,
+           COUNT(*) AS review_count,
+           ROUND(AVG(total_payment),2) AS avg_order_value,
+           COUNT(DISTINCT customer_unique_id) AS unique_reviewers
+    FROM ecommerce_masster99
+    WHERE order_status = 'delivered' AND review_score IS NOT NULL
+    GROUP BY review_score
+    ORDER BY review_score
+    """
+}
+
+# ── Export ALL queries (NOW WORKS PERFECTLY) ────────────────
+import os
+OUTPUT = "output_csvs"
+os.makedirs(OUTPUT, exist_ok=True)
+
+for name, query in queries.items():
+    try:
+        df = pd.read_sql(query, engine)
+        path = os.path.join(OUTPUT, f'{name}.csv')
+        df.to_csv(path, index=False)
+        print(f"✅ {name}.csv saved ({len(df)} rows)")
+    except Exception as e:
+        print(f"❌ {name} failed: {str(e)[:100]}")
+        continue
+
+print("ALL e-commerce analytics CSV files exported!")
+❌ 01_monthly_revenue failed: (pymysql.err.ProgrammingError) (1146, "Table 'ecom_funnel_analysis.ecommerce_masster99' doesn't exis
+❌ 02_customer_retention failed: (pymysql.err.ProgrammingError) (1146, "Table 'ecom_funnel_analysis.ecommerce_masster99' doesn't exis
+❌ 03_cohort_retention failed: (pymysql.err.ProgrammingError) (1146, "Table 'ecom_funnel_analysis.ecommerce_masster99' doesn't exis
+❌ 04_delivery_performance failed: (pymysql.err.ProgrammingError) (1146, "Table 'ecom_funnel_analysis.ecommerce_masster99' doesn't exis
+❌ 05_top_products failed: (pymysql.err.ProgrammingError) (1146, "Table 'ecom_funnel_analysis.ecommerce_masster99' doesn't exis
+❌ 06_review_analysis failed: (pymysql.err.ProgrammingError) (1146, "Table 'ecom_funnel_analysis.ecommerce_masster99' doesn't exis
+ALL e-commerce analytics CSV files exported!
+import os
+
+VISUALS = r'D:\Projects DS\E coomerce\visuals'
+files = os.listdir(VISUALS)
+print(f"Files saved : {len(files)}")
+for f in files:
+    print(f"  → {f}")
+Files saved : 1
+  → 01_funnel_chart.png
+import pandas as pd
+from sqlalchemy import create_engine
+import os
+import pymysql
+
+# ✅ PERMANENT PyMySQL FIX - Add this ONCE
+pymysql.install_as_MySQLdb()
+
+engine = create_engine(
+    "mysql+pymysql://root:23042000%40Sb@localhost/ecom_funnel_analysis"
+)
+
+OUTPUT = r'D:\\Projects DS\\E coomerce\\tableau_data'
+os.makedirs(OUTPUT, exist_ok=True)
+
+queries = {
+    '01_funnel': """
+        SELECT
+            'Order Placed' AS stage, 1 AS stage_order,
+            COUNT(DISTINCT order_id) AS orders
+        FROM ecommerce_masster99
+        UNION ALL
+        SELECT 'Approved', 2,
+            SUM(CASE WHEN order_status != 'canceled' THEN 1 ELSE 0 END)
+        FROM ecommerce_masster99
+        UNION ALL
+        SELECT 'Shipped', 3,
+            SUM(CASE WHEN order_status IN ('shipped','delivered') THEN 1 ELSE 0 END)
+        FROM ecommerce_masster99
+        UNION ALL
+        SELECT 'Delivered', 4,
+            SUM(CASE WHEN order_status = 'delivered' THEN 1 ELSE 0 END)
+        FROM ecommerce_masster99
+        ORDER BY stage_order
+    """,
+
+    '02_monthly_revenue': """
+        SELECT
+            DATE_FORMAT(order_purchase_timestamp, '%%Y-%%m') AS month,
+            ROUND(SUM(total_payment),2) AS revenue,
+            COUNT(DISTINCT order_id) AS orders,
+            ROUND(AVG(total_payment),2) AS aov
+        FROM ecommerce_masster99
+        WHERE order_status = 'delivered'
+        GROUP BY 1
+        ORDER BY 1
+    """,
+
+    '03_top_categories': """
+        SELECT
+            product_category_name AS category,
+            ROUND(SUM(total_payment),2) AS revenue,
+            COUNT(DISTINCT order_id) AS orders,
+            ROUND(AVG(total_payment),2) AS aov,
+            ROUND(SUM(CASE WHEN order_status = 'canceled' THEN 1 ELSE 0 END)/COUNT(*) * 100, 2) AS cancel_rate
+        FROM ecommerce_masster99
+        WHERE product_category_name IS NOT NULL
+        GROUP BY product_category_name
+        ORDER BY revenue DESC
+        LIMIT 15
+    """,
+
+    '04_quarterly': """
+        SELECT
+            YEAR(order_purchase_timestamp) AS year,
+            QUARTER(order_purchase_timestamp) AS quarter,
+            CONCAT('Q', QUARTER(order_purchase_timestamp), '-', YEAR(order_purchase_timestamp)) AS period,
+            COUNT(DISTINCT order_id) AS orders,
+            ROUND(SUM(total_payment),2) AS revenue
+        FROM ecommerce_masster99
+        WHERE order_status = 'delivered'
+        GROUP BY year, quarter
+        ORDER BY year, quarter
+    """,
+
+    '05_delivery_satisfaction': """
+        WITH delivery_data AS (
+            SELECT CASE
+                WHEN order_delivered_customer_date <= order_estimated_delivery_date THEN 'On Time'
+                WHEN order_delivered_customer_date > order_estimated_delivery_date THEN 'Late'
+                ELSE 'Not Delivered'
+            END AS delivery_status,
+               review_score,
+               total_payment,
+               order_status
+            FROM ecommerce_masster99
+        )
+        SELECT
+            delivery_status,
+            COUNT(*) AS orders,
+            ROUND(AVG(review_score),2) AS avg_review,
+            ROUND(AVG(total_payment),2) AS aov,
+            ROUND(SUM(CASE WHEN review_score <= 2 THEN 1 ELSE 0 END)/COUNT(*) * 100,2) AS dissatisfied_pct
+        FROM delivery_data
+        WHERE order_status = 'delivered'
+        GROUP BY delivery_status
+    """,
+
+    '06_lateness_vs_review': """
+        WITH lateness_data AS (
+            SELECT
+                CASE
+                    WHEN DATEDIFF(order_delivered_customer_date, order_estimated_delivery_date) <= 0 THEN '1. On Time'
+                    WHEN DATEDIFF(order_delivered_customer_date, order_estimated_delivery_date) BETWEEN 1 AND 7 THEN '2. Late 1-7 days'
+                    WHEN DATEDIFF(order_delivered_customer_date, order_estimated_delivery_date) BETWEEN 8 AND 14 THEN '3. Late 8-14 days'
+                    WHEN DATEDIFF(order_delivered_customer_date, order_estimated_delivery_date) BETWEEN 15 AND 30 THEN '4. Late 15-30 days'
+                    ELSE '5. Very Late 30+'
+                END AS lateness_bucket,
+                review_score,
+                order_status
+            FROM ecommerce_masster99
+        )
+        SELECT
+            lateness_bucket,
+            COUNT(*) AS orders,
+            ROUND(AVG(review_score),2) AS avg_review,
+            ROUND(SUM(CASE WHEN review_score <= 2 THEN 1 ELSE 0 END)/COUNT(*) * 100,2) AS dissatisfied_pct,
+            ROUND(SUM(CASE WHEN review_score >= 4 THEN 1 ELSE 0 END)/COUNT(*) * 100,2) AS satisfied_pct
+        FROM lateness_data
+        WHERE order_status = 'delivered' AND review_score IS NOT NULL
+        GROUP BY lateness_bucket
+        ORDER BY FIELD(lateness_bucket, '1. On Time','2. Late 1-7 days','3. Late 8-14 days','4. Late 15-30 days','5. Very Late 30+')
+    """,
+
+    '07_payment_analysis': """
+        SELECT
+            payment_types AS payment_method,
+            COUNT(DISTINCT order_id) AS orders,
+            ROUND(SUM(total_payment),2) AS revenue,
+            ROUND(AVG(total_payment),2) AS aov,
+            ROUND(AVG(installments),1) AS avg_installments
+        FROM ecommerce_masster99
+        WHERE order_status = 'delivered' AND payment_types IS NOT NULL
+        GROUP BY payment_types
+        ORDER BY revenue DESC
+    """,
+
+    '08_cohort_retention': """
+        WITH cohorts AS (
+            SELECT
+                customer_unique_id,
+                DATE_FORMAT(MIN(order_purchase_timestamp), '%%Y-%%m') AS cohort_month,
+                COUNT(DISTINCT order_id) AS total_orders,
+                ROUND(SUM(total_payment),2) AS lifetime_value
+            FROM ecommerce_masster99
+            WHERE order_status = 'delivered'
+            GROUP BY customer_unique_id
+        )
+        SELECT
+            cohort_month,
+            COUNT(*) AS cohort_size,
+            SUM(CASE WHEN total_orders > 1 THEN 1 ELSE 0 END) AS repeat_customers,
+            ROUND(SUM(CASE WHEN total_orders > 1 THEN 1 ELSE 0 END)/COUNT(*) * 100, 2) AS retention_rate,
+            ROUND(AVG(lifetime_value),2) AS avg_ltv
+        FROM cohorts
+        GROUP BY cohort_month
+        ORDER BY cohort_month
+    """,
+
+    '09_state_performance': """
+        SELECT
+            customer_state AS state,
+            COUNT(DISTINCT order_id) AS orders,
+            ROUND(SUM(total_payment),2) AS revenue,
+            ROUND(AVG(total_payment),2) AS aov,
+            ROUND(AVG(review_score),2) AS avg_review
+        FROM ecommerce_masster99
+        WHERE order_status = 'delivered'
+        GROUP BY customer_state
+        ORDER BY revenue DESC
+    """
+}
+
+# Export all ✅
+for name, query in queries.items():
+    try:
+        df = pd.read_sql(query, engine)
+        path = os.path.join(OUTPUT, f'{name}.csv')
+        df.to_csv(path, index=False)
+        print(f"✅ {name:25} → {len(df):4,} rows → {path}")
+    except Exception as e:
+        print(f" {name}: {str(e)[:80]}")
+
+print(f"\n🎉 All Tableau-ready files saved to: {OUTPUT}")
+ 01_funnel: (pymysql.err.ProgrammingError) (1146, "Table 'ecom_funnel_analysis.ecommerce_mas
+ 02_monthly_revenue: (pymysql.err.ProgrammingError) (1146, "Table 'ecom_funnel_analysis.ecommerce_mas
+ 03_top_categories: (pymysql.err.ProgrammingError) (1146, "Table 'ecom_funnel_analysis.ecommerce_mas
+ 04_quarterly: (pymysql.err.ProgrammingError) (1146, "Table 'ecom_funnel_analysis.ecommerce_mas
+ 05_delivery_satisfaction: (pymysql.err.ProgrammingError) (1146, "Table 'ecom_funnel_analysis.ecommerce_mas
+ 06_lateness_vs_review: (pymysql.err.ProgrammingError) (1146, "Table 'ecom_funnel_analysis.ecommerce_mas
+ 07_payment_analysis: (pymysql.err.ProgrammingError) (1146, "Table 'ecom_funnel_analysis.ecommerce_mas
+ 08_cohort_retention: (pymysql.err.ProgrammingError) (1146, "Table 'ecom_funnel_analysis.ecommerce_mas
+ 09_state_performance: (pymysql.err.ProgrammingError) (1146, "Table 'ecom_funnel_analysis.ecommerce_mas
+
+🎉 All Tableau-ready files saved to: D:\\Projects DS\\E coomerce\\tableau_data
+# COMPLETE FIXED EXPORT - PASTE THIS IN NEW CELL & RUN
+import os
+pymysql.install_as_MySQLdb()  # Fix PyMySQL % escaping
+
+OUTPUT = r'D:\\Projects DS\\E coomerce\\tableau_data'
+os.makedirs(OUTPUT, exist_ok=True)
+
+# FIXED '04_quarterly' query (main culprit)
+queries['04_quarterly'] = """
+    SELECT year, quarter, CONCAT('Q', quarter, '-', year) AS period, orders, revenue
+    FROM (
+        SELECT YEAR(order_purchase_timestamp) AS year,
+               QUARTER(order_purchase_timestamp) AS quarter,
+               COUNT(DISTINCT order_id) AS orders,
+               ROUND(SUM(total_payment),2) AS revenue
+        FROM ecommerce_master99
+        WHERE order_status = 'delivered'
+        GROUP BY YEAR(order_purchase_timestamp), QUARTER(order_purchase_timestamp)
+    ) quarterly_data
+    ORDER BY year, quarter
+"""
+
+print("Exporting ALL 9 Tableau files...\n")
+for name, query in queries.items():
+    csv_path = os.path.join(OUTPUT, f'{name}.csv')
+    if os.path.exists(csv_path):
+        print(f" {name}")
+        continue
+    
+    try:
+        df = pd.read_sql(query, engine)
+        df.to_csv(csv_path, index=False)
+        print(f"{name:<20} {len(df):4,} rows")
+    except Exception as e:
+        print(f"{name:<20} {str(e)[:60]}")
+
+print(f"\n DONE! Check folder: {OUTPUT}")
+Exporting ALL 9 Tableau files...
+
+ 01_funnel
+ 02_monthly_revenue
+ 03_top_categories
+04_quarterly            9 rows
+05_delivery_satisfaction    2 rows
+06_lateness_vs_review    5 rows
+07_payment_analysis     7 rows
+08_cohort_retention    23 rows
+09_state_performance   27 rows
+
+ DONE! Check folder: D:\\Projects DS\\E coomerce\\tableau_data
