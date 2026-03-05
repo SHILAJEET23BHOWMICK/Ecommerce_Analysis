@@ -1,0 +1,85 @@
+── Q3: Month-on-Month Revenue Growth Trend ─────────────────
+-- Business Question: Is revenue growing? Any seasonal patterns?
+-- Metric          : MoM Growth Rate
+
+WITH monthly_revenue AS (
+    SELECT
+        DATE_FORMAT(order_purchase_timestamp, '%Y-%m') AS month,
+        ROUND(SUM(total_payment), 2)                   AS revenue,
+        COUNT(DISTINCT order_id)                        AS total_orders
+    FROM ecommerce_master
+    WHERE order_status = 'delivered'
+    GROUP BY month
+)
+SELECT
+    month,
+    revenue,
+    total_orders,
+    LAG(revenue) OVER (ORDER BY month)                  AS prev_month_revenue,
+
+    ROUND(
+        (revenue - LAG(revenue) OVER (ORDER BY month)) /
+         LAG(revenue) OVER (ORDER BY month) * 100, 2
+    )                                                   AS mom_growth_pct,
+
+    -- Running total
+    ROUND(SUM(revenue) OVER (ORDER BY month), 2)        AS cumulative_revenue
+
+FROM monthly_revenue;
+
+-- ── Q4: Top 10 Revenue-Generating Product Categories ────────
+-- Business Question: Where is revenue concentrated?
+-- Metric          : Revenue Concentration, Pareto Analysis
+
+WITH category_revenue AS (
+    SELECT
+        product_category_name                           AS category,
+        COUNT(DISTINCT order_id)                        AS total_orders,
+        ROUND(SUM(total_payment), 2)                    AS revenue,
+        ROUND(AVG(total_payment), 2)                    AS avg_order_value,
+        ROUND(
+            SUM(total_payment) /
+            (SELECT SUM(total_payment)
+             FROM ecommerce_master
+             WHERE order_status = 'delivered') * 100,
+            2
+        ) AS revenue_share_pct
+    FROM ecommerce_master
+    WHERE order_status = 'delivered'
+      AND product_category_name IS NOT NULL
+    GROUP BY product_category_name
+)
+SELECT
+    category,
+    total_orders,
+    revenue,
+    avg_order_value,
+    revenue_share_pct,
+    ROUND(
+        SUM(revenue_share_pct) OVER (ORDER BY revenue DESC),
+        2
+    ) AS cumulative_share_pct
+FROM category_revenue
+ORDER BY revenue DESC
+LIMIT 10;
+
+-- ── Q5: Seasonal Revenue Pattern by Quarter ─────────────────
+-- Business Question: Which quarter consistently performs best?
+-- Metric          : Quarterly Revenue, Seasonality
+
+SELECT
+    YEAR(order_purchase_timestamp)                AS year,
+    QUARTER(order_purchase_timestamp)             AS quarter,
+    CONCAT('Q', QUARTER(order_purchase_timestamp),
+           '-', YEAR(order_purchase_timestamp))   AS period,
+    COUNT(DISTINCT order_id)                      AS total_orders,
+    ROUND(SUM(total_payment), 2)                  AS revenue,
+    ROUND(AVG(total_payment), 2)                  AS avg_order_value
+FROM ecommerce_master
+WHERE order_status = 'delivered'
+GROUP BY 
+    YEAR(order_purchase_timestamp),
+    QUARTER(order_purchase_timestamp),
+    CONCAT('Q', QUARTER(order_purchase_timestamp),
+           '-', YEAR(order_purchase_timestamp))   -- added here
+ORDER BY year, quarter;
