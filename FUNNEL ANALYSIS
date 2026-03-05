@@ -1,0 +1,58 @@
+-- ── Q1: Overall Conversion Rate by Funnel Stage ─────────────
+-- Business Question: At which stage do we lose the most customers?
+-- Metric          : Conversion Rate, Drop-off Rate
+
+SELECT
+    COUNT(DISTINCT order_id)                              AS total_orders,
+
+    SUM(CASE WHEN order_status != 'canceled'
+             THEN 1 ELSE 0 END)                          AS stage_2_approved,
+
+    SUM(CASE WHEN order_status IN ('shipped','delivered')
+             THEN 1 ELSE 0 END)                          AS stage_3_shipped,
+
+    SUM(CASE WHEN order_status = 'delivered'
+             THEN 1 ELSE 0 END)                          AS stage_4_delivered,
+
+    -- Conversion Rates
+    ROUND(SUM(CASE WHEN order_status != 'canceled'
+              THEN 1 ELSE 0 END)
+              / COUNT(*) * 100, 2)                       AS approval_rate_pct,
+
+    ROUND(SUM(CASE WHEN order_status IN ('shipped','delivered')
+              THEN 1 ELSE 0 END)
+              / COUNT(*) * 100, 2)                       AS shipping_rate_pct,
+
+    ROUND(SUM(CASE WHEN order_status = 'delivered'
+              THEN 1 ELSE 0 END)
+              / COUNT(*) * 100, 2)                       AS overall_conversion_pct,
+
+    -- Drop-off Rate
+    ROUND(SUM(CASE WHEN order_status = 'canceled'
+              THEN 1 ELSE 0 END)
+              / COUNT(*) * 100, 2)                       AS drop_off_rate_pct
+
+FROM ecommerce_master99;
+
+-- ── Q2: Cancellation Rate by Product Category ───────────────
+-- Business Question: Which categories cancel the most?
+-- Metric          : Drop-off Rate by Category
+
+SELECT
+    product_category_name                                AS category,
+    COUNT(DISTINCT order_id)                             AS total_orders,
+
+    SUM(CASE WHEN order_status = 'canceled'
+             THEN 1 ELSE 0 END)                          AS cancelled_orders,
+
+    ROUND(SUM(CASE WHEN order_status = 'canceled'
+              THEN 1 ELSE 0 END)
+              / COUNT(*) * 100, 2)                       AS cancellation_rate_pct,
+
+    ROUND(AVG(total_payment), 2)                         AS avg_order_value
+
+FROM ecommerce_master
+WHERE product_category_name IS NOT NULL
+GROUP BY product_category_name
+ORDER BY cancellation_rate_pct DESC
+LIMIT 15;
