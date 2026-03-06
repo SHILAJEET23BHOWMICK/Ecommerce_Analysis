@@ -117,6 +117,11 @@ was found and how each issue was resolved:
 | 6 | Bar Chart | How does lateness affect reviews? |
 | 7 | Bar Chart | Which payment method has highest AOV? |
 | 8 | Line Chart | Which cohort retains best? |
+
+<img width="1183" height="586" alt="download" src="https://github.com/user-attachments/assets/f156b775-9a83-4e33-9c8a-f9e399611d61" />
+
+
+
 | 9 | Filled Map | Which states generate most revenue? |
 
 
